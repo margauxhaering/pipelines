@@ -44,18 +44,17 @@ OrthoDB_human <- function(gene_name){
 }
 result_df <- do.call(rbind, lapply(ortho_df$Name, OrthoDB_human))
 
+result_df$Symbols <- paste(result_df$symbol_Up, result_df$symbol_ODB, sep = ',')
+result_df$Symbols <- sapply(strsplit(result_df$Symbols, ","), function(x) paste(unique(trimws(x)), collapse = ","))
+res <- data.frame(Id = result_df$geneID,Name = result_df$name,  Symbols = result_df$Symbols, Description = result_df$description, Hs_ortho=result_df$human_ortho)
 
-write.csv(result_df, "Desktop/orthologs2.tsv", row.names = F)
+res$Symbols<- gsub("|", ",", res$Symbols, fixed = T)
+res$Symbols <- sapply(strsplit(res$Symbols, ","), function(x) paste(unique(trimws(x)), collapse = ","))
+res$Hs_ortho<- gsub("|", ",", res$Hs_ortho, fixed = T)
+res$Hs_ortho <- sapply(strsplit(res$Hs_ortho, ","), function(x) paste(unique(trimws(x)), collapse = ","))
 
+write.csv(result_df, "Desktop/orthologs.tsv", row.names = F)
 
-ortho <- read.csv(file.choose(), stringsAsFactors = FALSE, sep = '\t')
-aliases <- read.csv(file.choose(), stringsAsFactors = FALSE, sep = '\t')
-df_merged <- merge(aliases, ortho, by = "Name", all.x = TRUE)
-
-
-gene  = 'LOC111318824'
-
-OrthoDB_human(gene)
 
 
 
