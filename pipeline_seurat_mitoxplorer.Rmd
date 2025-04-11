@@ -1,0 +1,443 @@
+---
+title: "seurat_to_mitox"
+output: html_document
+date: "2023-06-12"
+---
+```{r}
+ # important to set working directory for exportation of data
+setwd("~/Desktop/test/")
+
+# Packages
+usePackage <- function(p) 
+{
+  if (!is.element(p, installed.packages()[,1]))
+    install.packages(p, dep = TRUE)
+  require(p, character.only = TRUE)
+}
+usePackage('plotly')
+usePackage('scales')
+usePackage('Seurat')
+usePackage('dplyr')
+usePackage('rio')
+
+
+
+```
+
+
+```{r}
+#### Data upload and metadata df generation for filtering ####
+
+data <- readRDS('~/Desktop/filtered_gene_bc_matrices/pbmc3k_final.rds')
+
+genes_to_filter_from <- read.csv('~/Desktop/mouse_gene_function.txt',header = T, sep = '\t')
+
+```
+
+
+```{r}
+
+
+selected_genes <- data[row.names(data) %in% unlist(strsplit(x = toupper(genes_to_filter_from$MGI_symbol), split = '[\r\n]')), ]
+#DimPlot(selected_genes, reduction = "umap", label = TRUE, pt.size = 0.5) + NoLegend()
+
+
+selected_counts <- as.data.frame(selected_genes[["RNA"]]@data) #norm + scaled data
+#selected_counts <- as.data.frame(selected_genes@assays$RNA@counts) #raw data
+
+metadata_gen <- function(object){
+  umap_coord <- as.data.frame(object@reductions$umap@cell.embeddings)
+  metadata <- as.data.frame(object@active.ident)
+  metadata$Seq <- rownames(metadata)
+  metadata$Cluster <- object@meta.data$seurat_clusters
+  metadata$UMAP1 <- umap_coord$UMAP_1
+  metadata$UMAP2 <- umap_coord$UMAP_2
+  metadata$SampleID <- 'pbmc'
+  colnames(metadata) <- c('Cell_Type','Seq_ID', 'Cluster_ID','UMAP1','UMAP2', 'Sample_ID')
+  rm(umap_coord)
+  return(metadata)
+}
+
+metadata <- metadata_gen(selected_genes)
+tr_counts <- cbind(metadata$Cluster_ID, as.data.frame(t(selected_counts)), deparse.level = 1)
+tr_counts_umap <- cbind(tr_counts, metadata$Cell_Type, metadata$UMAP1, metadata$UMAP2, deparse.level = 1)
+#plot_ly(x=tr_counts_umap$`metadata$UMAP1`, y=tr_counts_umap$`metadata$UMAP2`, type = 'scatter', color = tr_counts_umap$`metadata$Cell_Type`)
+
+
+
+##### Separation per cell type   ####
+
+
+
+
+#create a dataframe per cell type
+for(cluster in 1:length(levels(metadata$Cluster_ID))){
+  nam <- paste("cluster", cluster, sep = "")
+  assign(nam, tr_counts[tr_counts['metadata$Cluster_ID'] == cluster-1,])
+}
+dflst <- mget(ls(pattern='^cluster\\d+'))
+list2env(lapply(dflst,`[`,-1), envir=.GlobalEnv)
+dflst <- mget(ls(pattern='^cluster\\d+'))
+
+
+
+################## pseudo bulk df ###########################################################################
+cpt <- 0
+genes <- rownames(selected_counts)
+final_pseudo_bulk <- as.data.frame(genes)
+for (celltype in dflst){
+  cl <- as.data.frame(t(celltype))
+  one <- vector()
+  two <- vector()
+  if ((ncol(cl)) %% 2 == 0){
+    mid = ncol(cl)/2
+  } else{
+    mid <- (ncol(cl)/2) +0.5
+  }
+  secondhalf <- mid +1 
+
+  pseudo_bulk <-as.data.frame(genes)
+  
+  for (gene in celltype){
+    one <- append(one,round(sum(cl[gene,1:mid])))
+    two <- append(two,round(sum(cl[gene,secondhalf:ncol(cl)])))
+  }
+  
+  cptCT <- cpt +1
+  name_1 <- paste(levels(metadata$Cell_Type)[cptCT],'1', sep = '_')
+  name_2 <- paste(levels(metadata$Cell_Type)[cptCT],'2', sep = '_')
+  pseudo_bulk$name1 <- one
+  pseudo_bulk$name2 <- two 
+  rownames(pseudo_bulk) <- pseudo_bulk[,1]
+  pseudo_bulk <- pseudo_bulk[,-1]
+  names(pseudo_bulk) <- c(name_1, name_2)
+  final_pseudo_bulk <- cbind(final_pseudo_bulk, pseudo_bulk,deparse.level = 1)
+  cpt = cpt +1
+}
+#final_pseudo_bulk <- final_pseudo_bulk[,-1]
+
+###############################################################################################################
+
+
+#keep genes where at least 25% of cells express the gene and delete the others
+unexpressed_genes <- function(df){
+  inf_genes  <- c();count <- 0
+  for (gene in names(df)){
+    for (cell in df[,gene]){
+      if (cell== 0){
+        count = count +1}}
+    if(count > (nrow(df)*0.75)){
+        inf_genes <- append(inf_genes, gene)}
+    df <- df[,!names(df) %in% inf_genes ]
+    count = 0
+  }
+  return(df)
+}
+
+dflst <- mget(ls(pattern='^cluster\\d+')) #apply for all cell types
+list2env(lapply(dflst,unexpressed_genes), envir=.GlobalEnv)
+dflst <- mget(ls(pattern='^cluster\\d+')) #apply for all cell types
+
+#create an object per sub cluster
+for(cell_type in 1:length(dflst)){
+  nam <- paste("cluster", cell_type, ".object", sep = "")
+  assign(nam, CreateSeuratObject(counts = t(as.data.frame(dflst[cell_type])), min.cells = 0))
+}
+
+oblst <- mget(ls(pattern='.object$')) 
+
+seurat_clustering <- function(object){
+  object <- FindVariableFeatures(object, selection.method = "vst", nfeatures = 2000)
+  object <- ScaleData(object, features = rownames(object))
+  if(as.numeric(ncol(object@assays$RNA@data))<50){npcs = as.numeric(ncol(object@assays$RNA@data))-1}else{npcs = 50}
+  object <- RunPCA(object, features = VariableFeatures(object = object), npcs = npcs)
+  object <- FindNeighbors(object, dims = 1:6)
+  object <- FindClusters(object, resolution = 0.5)
+  if(as.numeric(ncol(object@assays$RNA@data))<15){neighbors = as.numeric(ncol(object@assays$RNA@data))-1}else{neighbors = 15}
+  object <- RunUMAP(object, n.neighbors = neighbors, dims = 1:6)
+  return(object)
+}
+
+list2env(lapply(oblst,seurat_clustering), envir=.GlobalEnv) #apply clustering for all objects, can take a little while according to the nb of cell types
+oblst <- mget(ls(pattern='.object$'))
+
+
+#create a metadata per sub cluster
+for(ob in 1:length(oblst)){
+  nam <- paste("metadata", ob, sep = "_")
+  assign(nam, metadata_gen(oblst[[ob]]))
+}
+
+mtdtlst <- mget(ls(pattern='^metadata_\\d+'))
+dflst <- mget(ls(pattern='^cluster\\d+$')) #apply for all cell types
+
+
+#create a dataframe per subcell
+i = 1 
+  for(mtdt in 1:length(mtdtlst)){
+    for(subcelltype in 1:length(levels(mtdtlst[[mtdt]]$Cluster_ID))){
+        nam <- paste(i,"_cluster", mtdt,"subtype_", subcelltype-1, sep = "")
+        df<- cbind(mtdtlst[[mtdt]]$Cluster_ID, as.data.frame(dflst[[mtdt]]), deparse.level = 1)
+        assign(nam, df[df[,1] == subcelltype-1,])
+        i = i+1
+    }
+  }
+
+
+
+
+
+dfsublst <- mget(ls(pattern='^\\d+_cluster\\d+subtype_\\d+'))
+list2env(lapply(dfsublst,`[`,-1), envir=.GlobalEnv)
+dfsublst <- mget(ls(pattern='^\\d+_cluster\\d+subtype_\\d+'))
+list2env(lapply(dfsublst,unexpressed_genes), envir=.GlobalEnv)
+dfsublst <- mget(ls(pattern='^\\d+_cluster\\d+subtype_\\d+'))
+
+
+#### same but simplifies names for exportation ###
+
+i = 1 
+  for(mtdt in 1:length(mtdtlst)){
+    for(subcelltype in 1:length(levels(mtdtlst[[mtdt]]$Cluster_ID))){
+        nam <- paste(levels(metadata$Cell_Type)[mtdt],"subtype", subcelltype-1, sep = "_")
+        df<- cbind(mtdtlst[[mtdt]]$Cluster_ID, as.data.frame(dflst[[mtdt]]), deparse.level = 1)
+        assign(nam, df[df[,1] == subcelltype-1,])
+        i = i+1
+    }
+  }
+dfsublst2 <- mget(ls(pattern='[^[0-9]]*subtype_\\d+'))
+list2env(lapply(dfsublst2,`[`,-1), envir=.GlobalEnv)
+dfsublst2 <- mget(ls(pattern='[^[0-9]]*subtype_\\d+'))
+list2env(lapply(dfsublst2,unexpressed_genes), envir=.GlobalEnv)
+dfsublst2 <- mget(ls(pattern='[^[0-9]]*subtype_\\d+'))
+
+  
+################################################
+# creates folder of data to use for mitox3
+
+names(mtdtlst) <- paste('metadata', levels(metadata$Cell_Type), sep = '_')
+dflst2 <- dflst
+names(dflst2) <- levels(metadata$Cell_Type)
+dir.create(paste(getwd(),"R_sc_analysis", sep = "/"))
+exportation <- function(directory, file_list){
+  dir.create(paste(getwd(),"R_sc_analysis",directory, sep = "/"))
+  for (i in seq_along(file_list)) {
+    filename = paste(names(file_list)[i], ".csv",sep = '')
+    filepath <- paste(getwd(),'R_sc_analysis',directory,filename, sep = "/")
+    write.csv(file_list[[i]], filepath)
+  }
+  return(write.csv(file_list[[i]], filepath))
+}
+exportation('df',dflst2)
+exportation('subdf',dfsublst2)
+exportation('metadata',mtdtlst)
+write.csv(tr_counts_umap, paste(getwd(),'R_sc_analysis/data_umap.csv',sep = "/"))
+write.csv(final_pseudo_bulk, paste(getwd(),'R_sc_analysis/pseudo_bulk.csv',sep = "/"), row.names = F)
+
+####### removing useless stuff of environment ###
+rm(list=ls(pattern="*subtype*"))
+rm(list=ls(pattern="*cluster*"))
+rm(list=ls(pattern="*metadata*"))
+rm(dflst2, dfsublst2,pseudo_bulk,celltype,cl,df, cell_type, cpt, cptCT,gene,genes,i,mid, mtdt,nam,name_1,name_2, ob, one, secondhalf,subcelltype,two,oblst)
+
+```
+
+
+
+
+
+shiny app
+```{r}
+# Packages
+usePackage <- function(p) 
+{
+  if (!is.element(p, installed.packages()[,1]))
+    install.packages(p, dep = TRUE)
+  require(p, character.only = TRUE)
+}
+
+
+# BioCmanager packages
+BioCPackage <- function(p)
+{
+  if (!is.element(p, installed.packages()[,1]))
+    BiocManager::install(p, dep = TRUE)
+  require(p, character.only = TRUE)
+}
+
+usePackage("BiocManager")
+usePackage("shiny")
+usePackage("shinydashboard")
+usePackage("shinycssloaders")
+usePackage("shinythemes")
+usePackage("shinyWidgets")
+usePackage("shinyBS")
+usePackage("plotly")
+usePackage("dplyr")
+usePackage("DT")
+usePackage("data.table")
+usePackage("RColorBrewer")
+usePackage("utils")
+usePackage("tidyr")
+usePackage("dashboardthemes")
+usePackage("devtools")
+usePackage("stringr")
+usePackage("gtools")
+usePackage("rio")
+BioCPackage("gprofiler2")
+
+
+
+
+ui <- fluidPage(
+           plotlyOutput("umap") %>% withSpinner(),
+           column(
+          3,
+      selectInput(
+      "chosencluster",
+      "Choose a cluster",
+      choices = names(dflst),
+      selected = 'cluster1'
+    ), 
+    uiOutput('selectgene')),
+    column(9,
+           plotlyOutput("subumap")%>% withSpinner()),
+    column(3,
+           selectInput(
+            "chosensubcluster",
+            "Choose a sub cluster",
+            choices = mixedsort(names(dfsublst))),
+        sliderInput(
+      "topres_enrich",
+      "Top results to show",
+      min = 1,
+      max = 50,
+      value = 10,
+      step = 1
+    )),
+    column(9,
+           plotlyOutput('enrichSub') %>% withSpinner()),
+    dataTableOutput('EnrichResultTable'))
+
+
+server <- function(input, output, session) {
+  
+    output$umap <- renderPlotly({    # umap
+    
+    p <- plot_ly(x=tr_counts_umap$`metadata$UMAP1`, y=tr_counts_umap$`metadata$UMAP2`, type = 'scatter', color = tr_counts_umap$`metadata$Cell_Type`, colors = 'Set1', mode = 'markers')
+    p
+  })
+
+    observeEvent(input$chosencluster, {
+    nbclus <- as.numeric(gsub('cluster', '', input$chosencluster, fixed=TRUE))
+    umap1 <- mtdtlst[[nbclus]]$UMAP1
+    umap2 <- mtdtlst[[nbclus]]$UMAP2
+    col <- mtdtlst[[nbclus]]$Cluster_ID
+    
+    
+    output$selectgene <- renderUI({
+      selectInput(
+      'chosengene',
+      "Visualize a gene",
+      choices = mixedsort(names(dflst[[nbclus]]))
+    )
+    })
+            output$subumap <- renderPlotly({
+            chgene <- input$chosengene
+            gene <- dflst[[nbclus]][,chgene]
+      p <- plot_ly(x=umap1, y = umap2, type = 'scatter', color = col, colors = 'Set1', mode = 'markers', marker = list(size = ~gene*2, opacity = 0.5))
+      p
+    })
+
+    
+    })
+  
+        observeEvent(input$chosensubcluster,{
+                nbsubclus <- as.numeric(strsplit(input$chosensubcluster, '_' )[[1]][1])
+                subclus <- dfsublst[[nbsubclus]]
+                subclus <- as.data.frame(sapply(subclus,sd))
+                subclus$genes <- rownames(subclus)
+                names(subclus) <- c('variance','genes')
+                geneset <- unlist(strsplit(subclus$genes[subclus[,1]>1], split = '\n')) #> 1 meaning variance >1
+              
+                res <- gost(geneset,
+              organism = "hsapiens",
+              ordered_query = T,
+              user_threshold = 0.05,
+              correction_method = 'fdr',
+              domain_scope = 'known',
+              sources = c('GO:BP','GO:MF','GO:CC','KEGG','HP','HPA','TF','REAC','WP'),
+              significant = T)
+
+   
+              res_enrich <- as.data.frame(res$result)# result as data frame
+              res_enrich <- res_enrich[,-1]
+              res_enrich <- res_enrich[order(res_enrich[,2]),]
+              res_enrich <- res_enrich[1:input$topres_enrich,]
+              res_enrich <- res_enrich[,-1]
+              res_enrich <- res_enrich[,-2]
+              res_enrich <- res_enrich[,-2]
+              res_enrich <- res_enrich[,-2]
+              res_enrich <- res_enrich[,-2]
+              res_enrich <- res_enrich[,-2]
+              res_enrich <- res_enrich[,-5]
+              res_enrich <- res_enrich[,-5]
+
+               output$enrichSub <- renderPlotly({
+
+
+                        p <- plot_ly(
+                    res_enrich,
+                    x = ~(-log(p_value)),
+                    y = ~term_name,
+                    type = "bar",
+                    color = ~factor(source)
+              
+                  )%>%
+              layout(yaxis = list(categoryorder = "total ascending"))
+                        p
+                      })
+               
+                     output$EnrichResultTable <-  DT::renderDataTable({ # table render
+        DT::datatable(
+          res_enrich,        
+          extensions = 'Buttons',
+          option = list(
+            paging = TRUE,
+            searching = TRUE,
+            fixedColumns = TRUE,
+            autoWidth = TRUE,
+            ordering = TRUE,
+            dom = 'Bfrtip',
+            buttons = list(list(
+              extend = 'collection',
+              buttons = list(extend='csv',
+                             filename = paste("results_enrichment_", input$chosensubcluster, sep = "" )),
+              text = 'Download')),
+            scrollX = TRUE,
+            pageLength = 10,
+            searchHighlight = TRUE,
+            orderClasses = TRUE
+            
+          ),
+          
+          class = "display")
+      }, server = FALSE)
+
+
+})
+        
+          
+
+
+
+        
+
+ }
+
+shinyApp(ui, server)
+```
+
+
+
+
